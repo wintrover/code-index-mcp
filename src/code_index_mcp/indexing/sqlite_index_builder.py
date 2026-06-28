@@ -4,6 +4,7 @@ SQLite-backed index builder leveraging existing strategy pipeline.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -62,15 +63,23 @@ class SQLiteIndexBuilder(JSONIndexBuilder):
         parallel: bool = True,
         max_workers: Optional[int] = None,
         timeout: Optional[int] = None,
+        force_rebuild: bool = False,
     ) -> Dict[str, int]:
         """
         Build the SQLite index and return lightweight statistics.
+
+        When ``force_rebuild`` is *False* (the default) and existing LOCAL_AST
+        rows are found in the database the builder will attempt to **promote**
+        them to GLOBAL_LINKED instead of performing a full re-parse.  This is
+        much faster when only a few files have changed since the last build.
 
         Args:
             parallel: Whether to parse files in parallel.
             max_workers: Optional override for worker count.
             timeout: Optional override for parallel build timeout in seconds.
                 When None, timeout scales dynamically with file count.
+            force_rebuild: When True, always reset and rebuild from scratch
+                ignoring any existing LOCAL_AST data.
 
         Returns:
             Dictionary with totals for files, symbols, and languages.
@@ -184,6 +193,42 @@ class SQLiteIndexBuilder(JSONIndexBuilder):
             processed_files = 0
 
             self.store.initialize_schema()
+
+            # --- Intelligent promotion: skip full rebuild when possible ---
+            if not force_rebuild:
+                try:
+                    with self.store.connect(for_build=True) as conn:
+                        row = conn.execute(
+                            "SELECT COUNT(*) AS cnt FROM files "
+                            "WHERE integrity_level = 'LOCAL_AST'"
+                        ).fetchone()
+                        local_ast_count = row["cnt"] if row else 0
+                except Exception:
+                    # Table may not exist yet or schema mismatch – fall through
+                    local_ast_count = 0
+
+                if local_ast_count > 0:
+                    logger.info(
+                        "Found %d LOCAL_AST files – promoting to GLOBAL_LINKED",
+                        local_ast_count,
+                    )
+                    self._promote_local_ast_to_global()
+                    elapsed = time.time() - start_time
+                    logger.info(
+                        "LOCAL_AST promotion completed in %.2fs", elapsed
+                    )
+                    # Return stats based on what's in the DB now
+                    with self.store.connect(for_build=True) as conn:
+                        file_row = conn.execute("SELECT COUNT(*) AS cnt FROM files").fetchone()
+                        sym_row = conn.execute("SELECT COUNT(*) AS cnt FROM symbols").fetchone()
+                    return {
+                        "files": file_row["cnt"] if file_row else 0,
+                        "symbols": sym_row["cnt"] if sym_row else 0,
+                        "languages": 0,
+                        "timed_out": False,
+                        "total_files": total_files,
+                    }
+
             with self.store.connect(for_build=True) as conn:
                 conn.execute("PRAGMA foreign_keys=ON")
                 self._reset_database(conn)
@@ -271,7 +316,14 @@ class SQLiteIndexBuilder(JSONIndexBuilder):
             "DELETE FROM metadata WHERE key NOT IN ('schema_version')"
         )
 
-    def _insert_file(self, conn, path: str, file_info: FileInfo) -> int:
+    def _insert_file(
+        self,
+        conn,
+        path: str,
+        file_info: FileInfo,
+        content_hash: Optional[str] = None,
+        integrity_level: str = "GLOBAL_LINKED",
+    ) -> int:
         params = (
             path,
             file_info.language,
@@ -280,6 +332,8 @@ class SQLiteIndexBuilder(JSONIndexBuilder):
             json.dumps(file_info.exports or []),
             file_info.package,
             file_info.docstring,
+            content_hash,
+            integrity_level,
         )
         cur = conn.execute(
             """
@@ -290,8 +344,10 @@ class SQLiteIndexBuilder(JSONIndexBuilder):
                 imports,
                 exports,
                 package,
-                docstring
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                docstring,
+                content_hash,
+                integrity_level
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             params,
         )
@@ -348,9 +404,11 @@ class SQLiteIndexBuilder(JSONIndexBuilder):
     def _resolve_pending_calls_sqlite(
         self,
         conn,
-        pending_calls: List[Tuple[str, str]]
+        pending_calls: Optional[List[Tuple[str, str]]] = None,
     ) -> None:
         """Resolve cross-file call relationships directly in SQLite storage."""
+        if not pending_calls:
+            pending_calls = []
         if not pending_calls:
             return
 
@@ -411,3 +469,119 @@ class SQLiteIndexBuilder(JSONIndexBuilder):
                 "UPDATE symbols SET called_by=? WHERE symbol_id=?",
                 (json.dumps(merged), symbol_id),
             )
+
+    # Content-addressable lazy-index helpers -------------------------------
+
+    def _read_file_safe(self, full_path: str) -> Optional[str]:
+        """Read a file's contents, returning *None* on binary or I/O errors."""
+        try:
+            with open(full_path, "rb") as raw:
+                sample = raw.read(8192)
+                if b"\x00" in sample:
+                    return None
+                raw.seek(0)
+                import io
+                with io.TextIOWrapper(raw, encoding="utf-8", errors="ignore") as f:
+                    return f.read()
+        except OSError:
+            return None
+
+    def _promote_local_ast_to_global(self) -> None:
+        """Promote LOCAL_AST files to GLOBAL_LINKED atomically.
+
+        Files whose on-disk content hash still matches the stored hash are
+        promoted with a simple UPDATE.  Files with hash mismatches (or NULL
+        hashes) are re-parsed inside the same transaction so the database
+        stays consistent.
+
+        The entire operation runs inside a single ``connect()`` context, which
+        auto-commits on success and auto-rollbacks on any exception.
+        """
+        from .strategies import StrategyFactory
+
+        with self.store.connect(for_build=True, timeout=30.0) as conn:
+            # BEGIN IMMEDIATE: acquire write lock at transaction start
+            local_files = conn.execute(
+                "SELECT path, content_hash FROM files WHERE integrity_level = 'LOCAL_AST'"
+            ).fetchall()
+
+            reparsing_needed: List[Tuple[str, str, str]] = []
+
+            for row in local_files:
+                file_path = row["path"]
+                old_hash = row["content_hash"]
+                full_path = os.path.join(self.project_path, file_path)
+
+                if not os.path.isfile(full_path):
+                    # File was deleted – remove stale rows
+                    conn.execute(
+                        "DELETE FROM symbols WHERE file_id = "
+                        "(SELECT id FROM files WHERE path = ?)",
+                        (file_path,),
+                    )
+                    conn.execute("DELETE FROM files WHERE path = ?", (file_path,))
+                    continue
+
+                content = self._read_file_safe(full_path)
+                if content is None:
+                    continue
+
+                current_hash = hashlib.sha256(
+                    content.encode("utf-8")
+                ).hexdigest()
+
+                if current_hash == old_hash and old_hash is not None:
+                    # Hash matches → promote directly
+                    conn.execute(
+                        "UPDATE files SET integrity_level = 'GLOBAL_LINKED' "
+                        "WHERE path = ?",
+                        (file_path,),
+                    )
+                else:
+                    # Hash mismatch or NULL → need to re-parse
+                    reparsing_needed.append(
+                        (file_path, current_hash, content)
+                    )
+
+            # Re-parse hash-mismatched files within the same transaction
+            strategy_factory = StrategyFactory()
+            for file_path, current_hash, content in reparsing_needed:
+                # Delete old file row and its symbols
+                file_row = conn.execute(
+                    "SELECT id FROM files WHERE path = ?", (file_path,)
+                ).fetchone()
+                if file_row:
+                    conn.execute(
+                        "DELETE FROM symbols WHERE file_id = ?",
+                        (file_row["id"],),
+                    )
+                    conn.execute(
+                        "DELETE FROM files WHERE path = ?", (file_path,)
+                    )
+
+                # Parse with the appropriate strategy
+                ext = os.path.splitext(file_path)[1]
+                strategy = strategy_factory.get_strategy(ext)
+                symbols, file_info = strategy.parse_file(file_path, content)
+                file_id = self._insert_file(
+                    conn, file_path, file_info,
+                    content_hash=current_hash,
+                    integrity_level="GLOBAL_LINKED",
+                )
+                symbol_rows = self._prepare_symbol_rows(symbols, file_id)
+                if symbol_rows:
+                    conn.executemany(
+                        """
+                        INSERT INTO symbols(
+                            symbol_id, file_id, type, line, end_line,
+                            signature, docstring, called_by, short_name
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        symbol_rows,
+                    )
+
+            # Resolve cross-file called_by relationships (all files must be
+            # in the DB at this point).
+            self._resolve_pending_calls_sqlite(conn)
+            # with block ends: auto-COMMIT on success / auto-ROLLBACK on
+            # exception

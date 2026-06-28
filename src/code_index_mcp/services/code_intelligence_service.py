@@ -54,14 +54,14 @@ class CodeIntelligenceService(BaseService):
 
         # Use the global index manager
         index_manager = get_index_manager()
-        
+
         # Debug logging
         logger.info(f"Getting file summary for: {file_path}")
         logger.info(f"Index manager state - Project path: {index_manager.project_path}")
         logger.info(f"Index manager state - Has builder: {index_manager.index_builder is not None}")
         if index_manager.index_builder:
             logger.info(f"Index manager state - Has index: {index_manager.index_builder.in_memory_index is not None}")
-        
+
         # Get file summary from the deep index
         summary = index_manager.get_file_summary(file_path)
         logger.info(f"Summary result: {summary is not None}")
@@ -74,6 +74,7 @@ class CodeIntelligenceService(BaseService):
                 "file_path": file_path
             }
 
+        summary["index_completeness"] = self._get_index_completeness()
         return summary
 
     def _validate_analysis_request(self, file_path: str) -> None:
@@ -102,6 +103,34 @@ class CodeIntelligenceService(BaseService):
             if not file_path or '..' in file_path:
                 raise ValueError(f"Invalid file path: {file_path}")
 
+    def _get_index_completeness(self) -> Dict[str, Any]:
+        """Get index completeness metadata for weak determinism awareness.
+
+        Returns a dict with total_files, local_ast_count, and global_linked_count
+        so callers can assess how much of the project has been globally indexed.
+        """
+        index_manager = get_index_manager()
+        store = getattr(index_manager, "store", None)
+        if not store:
+            return {"total_files": 0, "local_ast_count": 0, "global_linked_count": 0}
+
+        try:
+            with store.connect() as conn:
+                total = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+                local_ast = conn.execute(
+                    "SELECT COUNT(*) FROM files WHERE integrity_level = 'LOCAL_AST'"
+                ).fetchone()[0]
+                global_linked = conn.execute(
+                    "SELECT COUNT(*) FROM files WHERE integrity_level = 'GLOBAL_LINKED'"
+                ).fetchone()[0]
+            return {
+                "total_files": total,
+                "local_ast_count": local_ast,
+                "global_linked_count": global_linked,
+            }
+        except Exception:
+            return {"total_files": 0, "local_ast_count": 0, "global_linked_count": 0}
+
     def get_symbol_body(self, file_path: str, symbol_name: str) -> Dict[str, Any]:
         """
         Get the code body of a specific symbol from a file.
@@ -128,25 +157,32 @@ class CodeIntelligenceService(BaseService):
         index_manager = get_index_manager()
         summary = index_manager.get_file_summary(file_path)
 
+        completeness = self._get_index_completeness()
+
         if not summary:
             return {
                 "status": "error",
                 "message": "File not found in index or deep index not built",
                 "file_path": file_path,
-                "symbol_name": symbol_name
+                "symbol_name": symbol_name,
+                "index_completeness": completeness,
             }
 
         exact_matches = self._find_symbol_matches(summary, symbol_name, exact_only=True)
         if len(exact_matches) == 1:
             symbol_type, symbol_info = exact_matches[0]
         elif len(exact_matches) > 1:
-            return self._ambiguous_symbol_response(file_path, symbol_name, exact_matches)
+            resp = self._ambiguous_symbol_response(file_path, symbol_name, exact_matches)
+            resp["index_completeness"] = completeness
+            return resp
         else:
             short_matches = self._find_symbol_matches(summary, symbol_name, exact_only=False)
             if len(short_matches) == 1:
                 symbol_type, symbol_info = short_matches[0]
             elif len(short_matches) > 1:
-                return self._ambiguous_symbol_response(file_path, symbol_name, short_matches)
+                resp = self._ambiguous_symbol_response(file_path, symbol_name, short_matches)
+                resp["index_completeness"] = completeness
+                return resp
             else:
                 symbol_info = None
                 symbol_type = None
@@ -161,7 +197,8 @@ class CodeIntelligenceService(BaseService):
                     "functions": [f.get("name") for f in summary.get("functions", [])],
                     "methods": [m.get("name") for m in summary.get("methods", [])],
                     "classes": [c.get("name") for c in summary.get("classes", [])]
-                }
+                },
+                "index_completeness": completeness,
             }
 
         line = symbol_info.get("line")
@@ -172,7 +209,8 @@ class CodeIntelligenceService(BaseService):
                 "status": "error",
                 "message": "Symbol found but line information is missing",
                 "file_path": file_path,
-                "symbol_name": symbol_name
+                "symbol_name": symbol_name,
+                "index_completeness": completeness,
             }
 
         # Read the file content
@@ -216,7 +254,8 @@ class CodeIntelligenceService(BaseService):
                 "code": code,
                 "signature": symbol_info.get("signature"),
                 "docstring": symbol_info.get("docstring"),
-                "called_by": symbol_info.get("called_by", [])
+                "called_by": symbol_info.get("called_by", []),
+                "index_completeness": completeness,
             }
 
         except FileNotFoundError:
@@ -224,14 +263,16 @@ class CodeIntelligenceService(BaseService):
                 "status": "error",
                 "message": f"File not found: {file_path}",
                 "file_path": file_path,
-                "symbol_name": symbol_name
+                "symbol_name": symbol_name,
+                "index_completeness": completeness,
             }
         except Exception as e:
             return {
                 "status": "error",
                 "message": f"Error reading file: {str(e)}",
                 "file_path": file_path,
-                "symbol_name": symbol_name
+                "symbol_name": symbol_name,
+                "index_completeness": completeness,
             }
 
     def _find_symbol_matches(self, summary: Dict[str, Any], symbol_name: str, exact_only: bool) -> List[tuple[str, Dict[str, Any]]]:
